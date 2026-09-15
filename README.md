@@ -10,6 +10,18 @@ external services, and no network access are required for official scoring.
 
 **Model is not included in Github due to large file size and must hence be downloaded. Read the setup below.**
 
+## Description
+ 
+**Catalogue Indexing:** An SQLite FTS5 virtual table indexes title/categories/features/details/store/description (BM25 over weighted columns), alongside per-constraint and per-coarse-category inverted indexes. 
+
+**Intent Routing:** The agent implicitly detects intent from the first message. A “Buying” opening ("A key requirement is: ...") have a clear constraint, so a slot is added immediately and pools get narrowed. A “Browsing” opening ("I'm looking for <category>...") carries only a category, so it gets ranked by BM25 + keyword match + popularity until constraints accumulate.
+
+**State Memory:** Per-session state tracks coarse category, disclosed constraint slots with weights, weak (unmatched) slots, positive classes, and negative attributes. Slots accumulate incrementally. On Intent Override ("ignore my earlier preference ...") the state machine performs slot erasure + rewrite. Pre-override slots are decayed to 30% of their weight, and the new constraint is added at 1.5×. 
+
+**Retrieval:** Multi-route retrieval is implemented. The agent will carry out exact-slot intersection first, followed by BM25 OR-expansion and a global popularity fallback.
+
+**Ranking:** Each item in a pool is ranked based on the weighted scoring below. Weights were selected by coordinate search on a seeded heldout split of the public sessions. Top 24 ranked candidates are rescored by Qwen3-Reranker-0.6B (CrossEncoder). The overall score is determined by a blended 0.6·score + 0.4·rerank.
+
 ## Contents
 
 ```text
@@ -67,13 +79,22 @@ aggregate metrics to `results.json` in the current directory.
 
 Expected aggregate results (verified on the frozen public set):
 
-| Metric         | Value    |
-| -------------- | -------- |
-| Hit Rate@10    | 0.99     |
-| MRR            | 0.663343 |
-| MTTC           | 2.005    |
-| Efficiency     | 0.8995   |
-| TechnicalScore | 0.873903 |
+| Metric         | Baseline    | Value    |
+| -------------- | ----------- | -------- |
+| Hit Rate@10    | 0.125       | 0.99     |
+| MRR            | 0.068034    | 0.663343 |
+| MTTC           | 9.81        | 2.005    |
+| Efficiency     | 0.119       | 0.8995   |
+| TechnicalScore | 0.10671     | 0.873903 |
+
+- **Hit Rate@10:** fraction of sessions that find the target within 10 turns.
+- **MRR:** mean reciprocal rank of the target; a miss contributes zero.
+- **MTTC:** mean first-hit turn; a miss is assigned turn 11.
+
+```
+Efficiency = clip((11 - MTTC) / 10, 0, 1)
+TechnicalScore = 0.50 × HitRate@10 + 0.30 × MRR + 0.20 × Efficiency
+```
 
 Runtime is dominated by the lazy local reranker (loaded on first `respond`
 call); measured 32 min 23 s for the full 200-session evaluation on a single
