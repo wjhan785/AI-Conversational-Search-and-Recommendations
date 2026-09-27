@@ -1,10 +1,6 @@
 # TechJam Shopping Copilot — Submission
 
-<p align="center">
-  <a href="[https://youtube.com](https://youtu.be/UONELNA3IQI)">
-    <img src="[https://youtube.com](https://youtu.be/UONELNA3IQI)" alt="Demo Video" width="70%">
-  </a>
-</p>
+[![Demo video](https://img.youtube.com/vi/UONELNA3IQI/0.jpg)](https://youtu.be/UONELNA3IQI)
 
 Conversational e-commerce search agent for the TechJam Conversational E-Commerce
 Search Challenge. The agent holds a dialogue with a simulated customer, asks
