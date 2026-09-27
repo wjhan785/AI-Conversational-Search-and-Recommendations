@@ -5,7 +5,7 @@
     <img src="https://img.youtube.com/vi/UONELNA3IQI/maxresdefault.jpg" alt="Demo video" width="600">
   </a>
   <br>
-  <em>Click to watch the demo</em>
+  <em>Click to watch the demo video</em>
 </p>
 
 Conversational e-commerce search agent for the TechJam Conversational E-Commerce
