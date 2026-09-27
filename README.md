@@ -2,8 +2,10 @@
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=UONELNA3IQI">
-    <img src="https://img.youtube.com/vi/UONELNA3IQI/0.jpg" alt="Demo video" width="600">
+    <img src="https://img.youtube.com/vi/UONELNA3IQI/maxresdefault.jpg" alt="Demo video" width="600">
   </a>
+  <br>
+  <em>Click to watch the demo</em>
 </p>
 
 Conversational e-commerce search agent for the TechJam Conversational E-Commerce
