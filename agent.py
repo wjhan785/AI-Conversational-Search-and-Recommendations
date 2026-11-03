@@ -1,27 +1,5 @@
 from __future__ import annotations
 
-# ============================================================================
-# ShopCopilot agent — TechJam conversational shopping agent.
-#
-# Per-turn pipeline (respond):
-#   _parse_message  -> disclose constraints from the customer's prose
-#   _retrieve       -> narrow the catalog: category pool, slot intersection,
-#                      negative filters, then score-rank the survivors
-#                      (lexical fusion + dense cosine term); fallbacks fuse
-#                      the FTS route and the dense route with RRF
-#   _rerank         -> CrossEncoder judge reorders the top-24
-#   _question       -> decide what attribute to ask next (or recommend)
-#
-# Scoring contract (evaluator/local_evaluator.py):
-#   - only the FIRST 10 unique, catalog-valid parent_asins per session count;
-#     exact string match; duplicates/invalid entries are dropped.
-#   - an exception raised from respond() is swallowed and scored as an empty
-#     response (a miss), so everything below is defensive.
-#   - the agent sees ONLY session_id + user_profile (reset) and
-#     user_message / turn / top_k (respond); ground truth is never visible.
-#   - token usage is reported for transparency but NOT scored.
-# ============================================================================
-
 import hashlib
 import json
 import math
@@ -31,13 +9,6 @@ import sqlite3
 import sys
 from collections import defaultdict
 from pathlib import Path
-
-# ============================================================================
-# Evaluator-faithful helpers.
-# Byte-identical to evaluator/local_evaluator.py so that the simulator's
-# intent-card disclosures match our catalog-side index exactly.
-# Guarded by tests/test_evaluator_fidelity.py.
-# ============================================================================
 
 MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric")
 SEARCH_FIELDS = ("title", "features", "details", "description", "categories", "store")
