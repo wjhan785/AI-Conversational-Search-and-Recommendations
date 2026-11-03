@@ -16,7 +16,7 @@ customer's hidden target product within at most 10 turns.
 This bundle is self-contained and runs **fully offline**: no API keys, no
 external services, and no network access are required for official scoring.
 
-**Model is not included in Github due to large file size and must hence be downloaded. Read the setup below.**
+**Models are not included in Github due to large file size and must hence be downloaded. Read the setup below.**
 
 ## Description
  
@@ -26,9 +26,11 @@ external services, and no network access are required for official scoring.
 
 **State Memory:** Per-session state tracks coarse category, disclosed constraint slots with weights, weak (unmatched) slots, positive classes, and negative attributes. Slots accumulate incrementally. On Intent Override ("ignore my earlier preference ...") the state machine performs slot erasure + rewrite. Pre-override slots are decayed to 30% of their weight, and the new constraint is added at 1.5×. 
 
-**Retrieval:** Multi-route retrieval is implemented. The agent will carry out exact-slot intersection first, followed by BM25 OR-expansion and a global popularity fallback.
+**Dense Retrieval:** all-MiniLM-L6-v2 bi-encoder and brute-force cosine similarity between the query and all 50,000 product embeddings.
 
-**Ranking:** Each item in a pool is ranked based on the weighted scoring below. Weights were selected by coordinate search on a seeded heldout split of the public sessions. Top 24 ranked candidates are rescored by Qwen3-Reranker-0.6B (CrossEncoder). The overall score is determined by a blended 0.6·score + 0.4·rerank.
+**BM25 Retrieval:** Multi-route retrieval is implemented. The agent will carry out exact-slot intersection first, followed by BM25 OR-expansion and a global popularity fallback.
+
+**Ranking:** Each item in a pool is ranked based on a weighted scoring with dense term, 2.0 × min-max(cosine). Weights were selected by coordinate search on a seeded heldout split of the public sessions. Top 24 ranked candidates are rescored by Qwen3-Reranker-0.6B (CrossEncoder). The overall score is determined by a blended 0.6·score + 0.4·rerank.
 
 ## Contents
 
@@ -64,10 +66,10 @@ pip install -r requirements.txt
 
 **Place the LLM reranker and the catalogue at where the agent can find them.**
 1. Catalogue MUST be downloaded to data/catalog.jsonl.
-2. LLM Reranker MUST be at assets/model/Qwen3-Reranker-0.6B.
-Download the asset folder from this link: https://drive.google.com/file/d/1kJFmS0nLtYqNbjBJdxPPKW22FuvaNYaJ/view?usp=sharing.
+2. all-MiniLM-L6-v2 MUST be at assets/model/all-MiniLM-L6-v2
+3. LLM Reranker MUST be at assets/model/Qwen3-Reranker-0.6B.
 
-Alternatively, you may download from Huggingface: https://huggingface.co/Qwen/Qwen3-Reranker-0.6B and place the model at assets/model/.
+You may download the models from Huggingface: https://huggingface.co/Qwen/Qwen3-Reranker-0.6B and place the model at assets/model/.
 
 If the model is missing the agent degrades silently to lexical-only ranking.
 
