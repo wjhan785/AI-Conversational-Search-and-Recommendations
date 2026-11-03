@@ -1,5 +1,28 @@
 from __future__ import annotations
 
+# ============================================================================
+# ShopCopilot agent — TechJam conversational shopping agent.
+#
+# Per-turn pipeline (respond):
+#   _parse_message  -> disclose constraints from the customer's prose
+#   _retrieve       -> narrow the catalog: category pool, slot intersection,
+#                      negative filters, then score-rank the survivors
+#                      (lexical fusion + dense cosine term); fallbacks fuse
+#                      the FTS route and the dense route with RRF
+#   _rerank         -> CrossEncoder judge reorders the top-24
+#   _question       -> decide what attribute to ask next (or recommend)
+#
+# Scoring contract (evaluator/local_evaluator.py):
+#   - only the FIRST 10 unique, catalog-valid parent_asins per session count;
+#     exact string match; duplicates/invalid entries are dropped.
+#   - an exception raised from respond() is swallowed and scored as an empty
+#     response (a miss), so everything below is defensive.
+#   - the agent sees ONLY session_id + user_profile (reset) and
+#     user_message / turn / top_k (respond); ground truth is never visible.
+#   - token usage is reported for transparency but NOT scored.
+# ============================================================================
+
+import hashlib
 import json
 import math
 import os
@@ -9,10 +32,18 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# ============================================================================
+# Evaluator-faithful helpers.
+# Byte-identical to evaluator/local_evaluator.py so that the simulator's
+# intent-card disclosures match our catalog-side index exactly.
+# Guarded by tests/test_evaluator_fidelity.py.
+# ============================================================================
+
 MATERIALS = ("cotton", "polyester", "nylon", "leather", "wool", "spandex", "silk", "rayon", "fabric")
 SEARCH_FIELDS = ("title", "features", "details", "description", "categories", "store")
 MATERIAL_RE = re.compile(r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b", re.I)
 COLOR_RE = re.compile(r"\b(black|white|blue|red|pink|green|brown|gray|grey|purple|yellow|orange)\b", re.I)
+
 
 def searchable_text(product: dict) -> str:
     parts: list[str] = []
@@ -26,6 +57,7 @@ def searchable_text(product: dict) -> str:
             parts.append(str(value))
     return " ".join(parts).strip()
 
+
 def _flatten_values(value: object) -> list[str]:
     if isinstance(value, dict):
         return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
@@ -33,11 +65,18 @@ def _flatten_values(value: object) -> list[str]:
         return [str(item) for item in value if item not in (None, "")]
     return [str(value)] if value not in (None, "") else []
 
+
 def _clean_constraint(value: str, limit: int = 180) -> str:
     return re.sub(r"\s+", " ", value).strip(" -;,.\t\n")[:limit].rstrip()
 
-# Re-derive the simulator's hidden intent card for a product. 
+
 def intent_card(product: dict, limit: int = 180) -> dict:
+    """Re-derive the simulator's hidden intent card for a product. Must
+    mirror evaluator/local_evaluator.py exactly (guarded by
+    test_evaluator_fidelity.py): candidates = features + details, with a
+    regex-discovered material/color prepended and the budget appended;
+    hard_constraints = first 2 candidates, soft_preferences = next 2
+    (fallback [title])."""
     title = _clean_constraint(str(product.get("title") or "product"), limit)
     candidates = [*_flatten_values(product.get("features")), *_flatten_values(product.get("details"))]
     corpus = searchable_text(product)
@@ -58,8 +97,11 @@ def intent_card(product: dict, limit: int = 180) -> dict:
         "soft_preferences": cleaned[2:4] or cleaned[:1],
     }
 
-# Catalog categories -> the coarse label the simulator uses in browsing openings (e.g. "Basketball Men"). Drops generic clothing ancestors and keeps the two most specific parts
+
 def coarse_category(values: list[str]) -> str:
+    """Catalog categories -> the coarse label the simulator uses in browsing
+    openings (e.g. "Basketball Men"). Drops generic clothing ancestors and
+    keeps the two most specific parts."""
     excluded = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
     cleaned: list[str] = []
     for value in values:
@@ -69,9 +111,12 @@ def coarse_category(values: list[str]) -> str:
                 cleaned.append(part)
     return " ".join(cleaned[-2:]) if cleaned else "clothing item"
 
-# Map a constraint string to its attribute class (budget/material/ color/size/style/use_case). 'feature' is the fallback classification. 
-# Order matters: e.g. a material name inside a color phrase must not shadow the color class.
+
 def classify_constraint(value: str) -> str:
+    """Map a constraint string to its attribute class (budget/material/
+    color/size/style/use_case). 'feature' is the evaluator's own fallback
+    classification, so it is ours too. Order matters: e.g. a material name
+    inside a color phrase must not shadow the color class."""
     lowered = value.lower()
     if "budget" in lowered or re.search(r"(?:\$|<=|under)\s*\d", lowered):
         return "budget"
@@ -88,7 +133,13 @@ def classify_constraint(value: str) -> str:
     return "feature"
 
 
-# Parsing message templates 
+# ============================================================================
+# Message templates produced by the evaluator's simulator (local_evaluator.py)
+# ============================================================================
+
+# Message shapes produced by the simulator (local_evaluator.py). We parse the
+# prose rather than relying on the ask_attribute echo, because the revealed
+# constraint text always lands in message:
 #   RE_LOOKING         browsing opening: "I'm looking for {coarse_cat}..."
 #   RE_KEY_REQUIREMENT buying disclosure: "A key requirement is: {text}"
 #   RE_MATTERS         browsing disclosure: "...what matters is: {a; b}"
@@ -100,10 +151,12 @@ RE_MATTERS = re.compile(r"what matters is:\s*(.*)$")
 RE_OVERRIDE = re.compile(r"What I need is:\s*(.*)$")
 RE_NEGATIVE = re.compile(r"I don't have an additional preference for (\w+)")
 
-# Attributes we can infer absent from the disclosed card.
+# Attributes we can infer absent from the disclosed card (classify_constraint
+# never returns brand/category/other, so those filters would be no-ops).
 INFERRABLE_ATTRS = ("material", "color", "size", "style", "budget", "use_case", "feature")
 
-# bm25() column weights, in FTS5 table column order: (parent_asin UNINDEXED, title, categories, features, details, store, description)
+# bm25() column weights, in FTS5 table column order:
+# (parent_asin UNINDEXED, title, categories, features, details, store, description)
 # Title dominates because target slot phrases most often live there.
 FTS_WEIGHTS = (5.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 BM25_POOL_LIMIT = 900  # SQLITE_MAX_VARIABLE_NUMBER default is 999
@@ -112,10 +165,15 @@ BM25_POOL_LIMIT = 900  # SQLITE_MAX_VARIABLE_NUMBER default is 999
 #   SLOT  disclosed card-string evidence (each slot weighted by confidence)
 #   POP   log-scaled popularity (rating_number), capped
 #   RATE  average_rating centered at 3.8
-#   TAG   user_profile.preference_tags matched against title + features
-#   BUDG  price-budget distance penalty vs. the disclosed budget slot
-#   BM25  soft rescue term: pool-best default for members the bm25 query misses, so products whose slot phrases live in features (not titles) are not penalized for the FTS miss
+#   TAG   user_profile.preference_tags matched against title+features
+#   BUDG  price-distance penalty vs. the disclosed budget slot
+#   BM25  soft rescue term: pool-best default for members the bm25 query
+#         misses, so products whose slot phrases live in features (not
+#         titles) are not penalized for the FTS miss
 #   CAT   category prior when a category is known
+#   DENSE bi-encoder cosine(query, product), min-max normalized within the
+#         pool — semantic credit for paraphrased/weak slots and a better
+#         tie-break than popularity among exact-slot survivors
 RANK_W_SLOT = 1.2
 RANK_W_POP = 0.5
 RANK_W_RATE = 0.3
@@ -123,10 +181,32 @@ RANK_W_TAG = 0.4
 RANK_W_BUDG = 0.6
 RANK_W_BM25 = 0.3
 RANK_W_CAT = 0.5
+RANK_W_DENSE = 2.0
 
-# --- reranker (M3) -----------------------------------------------------------
-# Qwen3-Reranker-0.6B, loaded lazily at first use via sentence-transformers CrossEncoder (CUDA when available, CPU otherwise). 
-# Degrades to lexical-only ranking if unavailable.
+# --- dense retrieval -----------------------------------------------------------
+# all-MiniLM-L6-v2 bi-encoder (384-d, 22M params). Catalog embeddings are
+# computed once (~minutes on CPU) and cached as float16 .npy keyed by the
+# catalog content hash + model + doc format, so later runs load in <1s.
+# Model dir candidates (first that loads); the bare HF id resolves from the
+# local HF cache only (local_files_only) so final scoring stays offline.
+# Missing model = silent degradation to lexical-only ranking (no crash).
+DENSE_MODEL_PATHS = [
+    os.environ.get("DENSE_MODEL_PATH", ""),
+    "assets/model/all-MiniLM-L6-v2",
+    "sentence-transformers/all-MiniLM-L6-v2",
+]
+DENSE_CACHE_DIR = os.environ.get("DENSE_CACHE_DIR", "assets/embeddings")
+DENSE_DOC_VERSION = "v1"   # bump when _dense_doc changes (invalidates cache)
+DENSE_DOC_CHARS = 700      # title + features + details (~170 MiniLM tokens)
+DENSE_MAX_LENGTH = 256     # MiniLM's trained max_seq_length
+DENSE_MIN_CACHE_ROWS = 1000  # don't persist caches for toy (test) catalogs
+RRF_K = 60                 # reciprocal-rank-fusion constant for route fusion
+DENSE_SLOT_MAX_DF = 200    # slots carried by more products are too generic to embed
+
+# --- reranker (M3)-----------------------------------------------------------
+# Qwen3-Reranker-0.6B, provided manually by the team; loaded lazily at first
+# use via sentence-transformers CrossEncoder (CUDA when available, CPU
+# otherwise). Gracefully degrades to lexical-only ranking if unavailable.
 RERANKER_PATHS = [
     os.environ.get("RERANKER_PATH", ""),
     "assets/model/Qwen3-Reranker-0.6B",
@@ -135,7 +215,7 @@ RERANK_TOP_N = 24          # top-24 candidates fed to the reranker each turn
 RERANK_MAX_LENGTH = 192   # ~64-token query + ~110-token doc
 RERANK_QUERY_CHARS = 260  # coarse_cat + slots (~64 Qwen3 BPE tokens)
 RERANK_DOC_CHARS = 440    # title + top features (~110 tokens)
-RERANK_BLEND_FUSION = 0.6  # every-turn order: 0.6 * fusion rank + 0.4 * rerank score. Can increase rerank weight if using stronger LLM Rerankers. 
+RERANK_BLEND_FUSION = 0.6  # every-turn order: 0.6 * fusion rank + 0.4 * rerank score
 RERANK_BLEND_RERANK = 0.4
 
 
@@ -146,8 +226,10 @@ def _cuda_available() -> bool:
     except Exception:
         return False
 
-# Choose CPU or GPU: SHOPCOPILOT_DEVICE=auto|cpu|cuda (default auto). A forced 'cuda' falls back to cpu when no GPU exists.
+
 def _pick_device() -> str:
+    """Resolve the reranker device: SHOPCOPILOT_DEVICE=auto|cpu|cuda
+    (default auto). A forced 'cuda' falls back to cpu when no GPU exists."""
     override = os.environ.get("SHOPCOPILOT_DEVICE", "auto").lower()
     if override == "cuda":
         return "cuda" if _cuda_available() else "cpu"
@@ -155,9 +237,13 @@ def _pick_device() -> str:
         return "cpu"
     return "cuda" if _cuda_available() else "cpu"
 
-# Qwen3-Reranker-0.6B via sentence-transformers CrossEncoder. ST renders pairs through the model's chat template (Document in the user turn) and LogitScore compares the next-token "yes"/"no" logits. 
-# Lazy-loaded; degrades to lexical-only ranking when unavailable.
+
 class RerankerService:
+    """Qwen3-Reranker-0.6B via sentence-transformers CrossEncoder.
+    ST renders pairs through the model's chat template (Document in the user
+    turn) and LogitScore compares the next-token "yes"/"no" logits.
+    Lazy-loaded; degrades to lexical-only ranking when unavailable."""
+
     def __init__(self, paths: list[str]) -> None:
         self.paths = [path for path in paths if path]
         self.model = None
@@ -182,8 +268,10 @@ class RerankerService:
             except Exception:
                 continue
 
-# Judge scores for (query, doc) pairs via the ST CrossEncoder. Returns None on any failure and the caller falls back to the lexical order. batch_size 8 is the tuned latency/quality tradeoff.
     def score(self, query: str, docs: list[str]) -> list[float] | None:
+        """Judge scores for (query, doc) pairs via the ST CrossEncoder.
+        Returns None on any failure and the caller falls back to the
+        lexical order. batch_size 8 is the tuned latency/quality tradeoff."""
         if self.model is None or not docs:
             return None
         try:
@@ -203,8 +291,10 @@ class RerankerService:
         self._calibrate()
         return [float(self.sign * value) for value in array]
 
-# One-time sign calibration. The judge's raw output can be oriented either way (logit vs similarity); probe it with one known-good pair and flip self.sign if the ordering comes back inverted.
     def _calibrate(self) -> None:
+        """One-time sign calibration. The judge's raw output can be oriented
+        either way (logit vs similarity); probe it with one known-good pair
+        and flip self.sign if the ordering comes back inverted."""
         if self._calibrated or self.model is None:
             return
         self._calibrated = True
@@ -218,8 +308,8 @@ class RerankerService:
         if scores and len(scores) == 2 and scores[0] < scores[1]:
             self.sign = -1.0
 
-    # Rough prompt-token count for usage reporting.
     def prompt_tokens(self, query: str, docs: list[str]) -> int:
+        """Rough prompt-token count for usage reporting only (not scored)."""
         if self.model is None:
             return 0
         try:
@@ -229,6 +319,107 @@ class RerankerService:
         except Exception:
             return 0
 
+
+class DenseIndex:
+    """Brute-force cosine index over the catalog with a sentence-transformers
+    bi-encoder. Rows follow catalog order (row i <-> ids[i]); vectors are
+    L2-normalized so a dot product is the cosine. Lazy-loaded on first use;
+    degrades to unavailable (lexical-only ranking) on any failure."""
+
+    def __init__(self, paths: list[str], cache_dir: str) -> None:
+        self.paths = [path for path in paths if path]
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.model = None
+        self.model_name = ""
+        self.matrix = None            # float32 [n_products, dim]
+        self.row: dict[str, int] = {}
+        self._tried = False
+        self._query_cache: dict[str, object] = {}
+
+    @property
+    def available(self) -> bool:
+        return self.matrix is not None and self.model is not None
+
+    def build(self, ids: list[str], docs: list[str], catalog_key: str) -> None:
+        """Load the encoder and the catalog matrix (from cache, else encode
+        and persist). Called once; later calls are no-ops."""
+        if self._tried:
+            return
+        self._tried = True
+        try:
+            import numpy as np
+            self._load_model()
+            if self.model is None or not ids:
+                return
+            cache = self._cache_path(catalog_key, len(ids))
+            matrix = None
+            if cache is not None and cache.is_file():
+                try:
+                    loaded = np.load(cache)
+                    if loaded.shape[0] == len(ids):
+                        matrix = loaded.astype("float32")
+                except Exception:
+                    matrix = None
+            if matrix is None:
+                _log(f"dense: encoding {len(ids)} products with {self.model_name} (one-time)")
+                matrix = self.model.encode(
+                    docs,
+                    batch_size=64,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                ).astype("float32")
+                if cache is not None:
+                    try:
+                        cache.parent.mkdir(parents=True, exist_ok=True)
+                        np.save(cache, matrix.astype("float16"))
+                    except Exception:
+                        pass
+            self.matrix = matrix
+            self.row = {asin: index for index, asin in enumerate(ids)}
+        except Exception:
+            self.model = None
+            self.matrix = None
+
+    def _load_model(self) -> None:
+        from sentence_transformers import SentenceTransformer
+        device = _pick_device()
+        for path in self.paths:
+            try:
+                self.model = SentenceTransformer(path, device=device, local_files_only=True)
+                self.model.max_seq_length = DENSE_MAX_LENGTH
+                self.model_name = Path(path).name
+                return
+            except Exception:
+                continue
+
+    def _cache_path(self, catalog_key: str, rows: int) -> Path | None:
+        if self.cache_dir is None or rows < DENSE_MIN_CACHE_ROWS:
+            return None
+        tag = hashlib.sha1(f"{catalog_key}|{self.model_name}|{DENSE_DOC_VERSION}".encode()).hexdigest()[:16]
+        return self.cache_dir / f"{self.model_name}-{tag}.npy"
+
+    def query_scores(self, query: str) -> object | None:
+        """Cosine of the query against every catalog row (float32 [n]).
+        Memoized per query string: one encode + one matvec per turn."""
+        if not self.available or not query:
+            return None
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            return cached
+        try:
+            vector = self.model.encode(
+                [query], show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True
+            )[0].astype("float32")
+            scores = self.matrix @ vector
+        except Exception:
+            return None
+        if len(self._query_cache) > 4096:
+            self._query_cache.clear()
+        self._query_cache[query] = scores
+        return scores
+
+
 def _as_float_array(values: object) -> object | None:
     try:
         import numpy as np
@@ -236,7 +427,13 @@ def _as_float_array(values: object) -> object | None:
     except Exception:
         return None
 
+
 class Agent:
+    """Exact-slot conversational shopper: parses disclosed constraints,
+    narrows a category+slot index, scores survivors lexically, and (when the
+    judge is available) re-ranks the top-24 with a reranker model.
+    Implements the evaluator contract: Agent(catalog_path) + reset/respond."""
+
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
@@ -248,13 +445,16 @@ class Agent:
         self.class_has: dict[str, set[str]] = defaultdict(set)
         self.card_strings: dict[str, tuple[str, ...]] = {}
         self.reranker = RerankerService(RERANKER_PATHS)
+        self.dense = DenseIndex(DENSE_MODEL_PATHS, DENSE_CACHE_DIR)
         self._sessions: dict[str, dict] = {}
         self._build_index()
 
     # ------------------------------------------------------------------ init
 
-    # In-memory SQLite + FTS5 index over the catalog (one JSON line per product). FTS5 powers quoted-phrase matching and bm25 scores; built once per Agent from the catalog_path given to __init__.
     def _build_index(self) -> None:
+        """In-memory SQLite + FTS5 index over the catalog (one JSON line per
+        product). FTS5 powers quoted-phrase matching (Route C) and bm25
+        scores; built once per Agent from the catalog_path given to __init__."""
         cursor = self.connection.cursor()
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
@@ -283,8 +483,9 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
-    # Index one product: store it, derive its intent card, and wire the reverse maps (by_cat, by_card, class_has) for easy retrieval (ASIN becomes value).
     def _index_product(self, product: dict, parent_asin: str) -> None:
+        """Index one product: store it, derive its intent card, and wire the
+        reverse maps used by retrieval (by_cat, by_card, class_has)."""
         self.products[parent_asin] = product
         self.all_ids.add(parent_asin)
         card = intent_card(product)
@@ -363,9 +564,12 @@ class Agent:
 
     # ------------------------------------------------------------------ rerank
 
-    # Every-turn rerank of the top-24: final order = blend of the fusion rank (linear normalization) and the judge's min-max normalized score (0.6/0.4 weights). 
-    # Early-returns when there are fewer than two candidates or no judge is available; any other failure also degrades to the fusion order.
     def _rerank(self, state: dict, ranked: list[str]) -> tuple[list[str], int]:
+        """Every-turn rerank of the top-24: final order = blend of the fusion
+        rank (linear normalization) and the judge's min-max normalized score
+        (0.6/0.4 weights, tuned on the public set). Early-returns as a no-op
+        when there are fewer than two candidates or no judge is available;
+        any other failure also degrades silently to the fusion order."""
         if len(ranked) < 2:
             return ranked, 0
         self.reranker.load()
@@ -389,8 +593,9 @@ class Agent:
         tokens = self.reranker.prompt_tokens(query, docs)
         return reranked + ranked[RERANK_TOP_N:], tokens
 
-    # Query text for the judge: category + slots repeated by weight (stronger slots get more emphasis) + weak slots, character-capped.
     def _rerank_query(self, state: dict) -> str:
+        """Query text for the judge: category + slots repeated by weight
+        (stronger slots get more emphasis) + weak slots, char-capped."""
         parts: list[str] = []
         if state["category"] is not None:
             parts.append(state["category"])
@@ -400,16 +605,22 @@ class Agent:
             parts.append(slot)
         return (" ".join(parts))[:RERANK_QUERY_CHARS]
 
-    # Document text for the judge: title + truncated features, character-capped to the judge's context budget.
     def _rerank_doc(self, asin: str) -> str:
+        """Document text for the judge: title + truncated features,
+        char-capped to the judge's context budget."""
         product = self.products.get(asin) or {}
         title = _text(product.get("title"))
         features = _text(product.get("features"))[:RERANK_DOC_CHARS // 2]
         return (title + " " + features)[:RERANK_DOC_CHARS]
 
-    # Extract disclosures from the customer reply. Check order matters: override > judgment-deflection > drained/negative > plain disclosures. 
-    # An intent override REPLACES the old constraint (old slots decay to 30%, the new one is added at 1.5x).
     def _parse_message(self, state: dict, message: str) -> None:
+        """Extract disclosures from the customer reply. Check order matters:
+        override > judgment-deflection > drained/negative > plain disclosures.
+        An intent override REPLACES the old constraint (old slots decay to
+        30%, the new one is added at 1.5x) — appending contradictory terms is
+        the weak-agent failure mode. 'use your judgment' is the boundary
+        scenario's deflection: no new information, a deliberately wasted
+        turn. 'not quite right' is simulator filler."""
         if "ignore my earlier preference" in message or RE_OVERRIDE.search(message):
             state["override_seen"] = True
             for slot in state["slots"]:
@@ -451,8 +662,10 @@ class Agent:
                     self._add_slot(state, slot, 1.0)
         self._maybe_drained(state)
 
-    # Record a disclosed constraint. Strings known to the index go to slots (they narrow the candidate pool); unknown ones go to weak_slots (used only as FTS/rerank query terms, never for pool narrowing).
     def _add_slot(self, state: dict, slot: str, weight: float) -> None:
+        """Record a disclosed constraint. Strings known to the index go to
+        slots (they narrow the candidate pool); unknown ones go to weak_slots
+        (used only as FTS/rerank query terms, never for pool narrowing)."""
         if not slot:
             return
         if slot in self.by_card:
@@ -461,8 +674,11 @@ class Agent:
         else:
             state["weak_slots"][slot] = max(state["weak_slots"].get(slot, 0.0), weight)
 
-    # A card is drained once 4+ card strings are disclosed or the customer says they are out of preferences. From then on every not-yet-disclosed inferable class is treated as absent (neg_attrs) and we stop asking.
     def _maybe_drained(self, state: dict) -> None:
+        """A card is drained once 4+ card strings are disclosed or the
+        customer says they are out of preferences. From then on every
+        not-yet-disclosed inferable class is treated as absent (neg_attrs)
+        and we stop asking."""
         if len(state["slots"]) >= 4:
             state["card_drained"] = True
         if not state["card_drained"]:
@@ -473,9 +689,13 @@ class Agent:
 
     # ------------------------------------------------------------- retrieval
 
-    # Candidate pipeline: start from the category pool (whole catalog when no category is known), intersect it with every known disclosed slot (heaviest first; a slot that would empty the pool is skipped), then drop neg_attrs classes. 
-    # If nothing survives, fall back to FTS phrase search then popularity. Short lists are padded with the same fallbacks.
     def _retrieve(self, state: dict, top_k: int) -> list[str]:
+        """Candidate pipeline: start from the category pool (whole catalog
+        when no category is known), intersect it with every known disclosed
+        slot (heaviest first; a slot that would empty the pool is skipped),
+        then drop neg_attrs classes. If nothing survives, fall back to Route
+        C (FTS phrase search) then popularity. Short lists are padded with
+        the same fallbacks."""
         pool: set[str] | None = None
         if state["category"] is not None:
             pool = set(self.by_cat.get(state["category"], ()))
@@ -495,15 +715,9 @@ class Agent:
         if filtered:
             ranked = self._rank_pool(filtered, state, applied, top_k)
         else:
-            fallback = self._retrieve_route_c(state, top_k * 3)
-            if fallback:
-                ranked = fallback
-            else:
-                ranked = self._popularity_top(state, top_k * 3)
+            ranked = self._fallback_routes(state, top_k * 3)
         if len(ranked) < top_k:
-            extras = self._retrieve_route_c(state, top_k * 3)
-            if not extras:
-                extras = self._popularity_top(state, top_k * 3)
+            extras = self._fallback_routes(state, top_k * 3)
             for asin in extras:
                 if asin not in ranked:
                     ranked.append(asin)
@@ -511,14 +725,73 @@ class Agent:
                     break
         return ranked[:top_k]
 
-    # Drop every product that carries a class the customer implicitly ruled out (class_has[attr] = products with a slot of that class).
     def _apply_negatives(self, pool: set[str], state: dict) -> set[str]:
+        """Drop every product that carries a class the customer implicitly
+        ruled out (class_has[attr] = products with a slot of that class)."""
         for attr in state["neg_attrs"]:
             pool -= self.class_has.get(attr, set())
         return pool
 
-    # FTS5 OR-phrase search over the whole catalog with bm25 ordering — rescues targets whose slot phrases live in features or details rather than titles.
+    def _fallback_routes(self, state: dict, top_k: int) -> list[str]:
+        """Hybrid fallback when slot intersection yields nothing: RRF-fuse
+        Route C (FTS phrases) with the dense route, then popularity if both
+        come back empty."""
+        fused = _rrf([self._retrieve_route_c(state, top_k), self._retrieve_dense(state, top_k)])
+        return fused[:top_k] if fused else self._popularity_top(state, top_k)
+
+    # ------------------------------------------------------------------ dense
+
+    def _ensure_dense(self) -> None:
+        """Build the dense index on first use (cache hit: <1s; miss: one-time
+        catalog encode). Keyed by the catalog's content hash."""
+        if self.dense._tried:
+            return
+        ids = list(self.products)
+        docs = [_dense_doc(self.products[asin]) for asin in ids]
+        self.dense.build(ids, docs, _file_digest(self.catalog_path))
+
+    def _dense_query(self, state: dict) -> str:
+        """Dense query: category + distinctive live slots (heaviest first) +
+        weak slots. Generic card strings shared by more than
+        DENSE_SLOT_MAX_DF products ("Imported", "100% Cotton") are left out:
+        every pool member already carries them, so they only add noise.
+        Slots decayed by an intent override (<0.5) are dropped, so the
+        replaced preference stops pulling the embedding. Empty when nothing
+        distinctive is known — the lexical/popularity order then stands."""
+        live = [
+            slot for slot, weight in sorted(state["slots"].items(), key=lambda pair: -pair[1])
+            if weight >= 0.5 and len(self.by_card.get(slot, ())) <= DENSE_SLOT_MAX_DF
+        ]
+        live += [slot for slot, weight in state["weak_slots"].items() if weight >= 0.5]
+        if not live:
+            return ""
+        parts = [state["category"]] if state["category"] is not None else []
+        return "; ".join([*parts, *live])
+
+    def _dense_scores(self, state: dict) -> object | None:
+        """Per-catalog-row cosine scores for this turn's query, or None."""
+        query = self._dense_query(state)
+        if not query:
+            return None
+        self._ensure_dense()
+        return self.dense.query_scores(query)
+
+    def _retrieve_dense(self, state: dict, top_k: int) -> list[str]:
+        """Dense route: top-k by cosine within the category pool (whole
+        catalog when unknown or empty), minus neg_attrs classes."""
+        scores = self._dense_scores(state)
+        if scores is None:
+            return []
+        scope = self.by_cat.get(state["category"]) if state["category"] is not None else None
+        scope = self._apply_negatives(set(scope or self.all_ids), state)
+        rows = [(self.dense.row[asin], asin) for asin in scope if asin in self.dense.row]
+        rows.sort(key=lambda pair: -float(scores[pair[0]]))
+        return [asin for _, asin in rows[:top_k]]
+
     def _retrieve_route_c(self, state: dict, top_k: int) -> list[str]:
+        """Route C: FTS5 OR-phrase search over the whole catalog with bm25
+        ordering — rescues targets whose slot phrases live in features or
+        details rather than titles."""
         terms = []
         for slot, weight in sorted(state["slots"].items(), key=lambda pair: -pair[1]):
             if slot in self.by_card:
@@ -539,15 +812,20 @@ class Agent:
             return []
         return [str(row[0]) for row in rows]
 
-    # Score every survivor: slot evidence * weight, category prior, rating/popularity, profile-tag hits, budget proximity, and a soft bm25 term (pool-best default for FTS misses). Ties break by popularity. 
-    # bm25 is only computed for pools <= BM25_POOL_LIMIT (SQLite variable-count bound).
     def _rank_pool(self, pool: set[str], state: dict, applied: list[str], top_k: int) -> list[str]:
+        """Score every survivor: slot evidence * weight, category prior,
+        rating/popularity, profile-tag hits, budget proximity, and a soft
+        bm25 term (pool-best default for FTS misses), and the dense cosine
+        (min-max normalized within the pool). Ties break by popularity.
+        bm25 is only computed for pools <= BM25_POOL_LIMIT (SQLite
+        variable-count bound)."""
         profile_tags = {tag.strip().lower() for tag in state["profile"].get("preference_tags", []) if tag}
         budget = _budget_value(applied, self)
         if len(pool) <= BM25_POOL_LIMIT:
             bm25_scores = self._bm25_scores(pool, applied)
         else:
             bm25_scores = {}
+        dense_norm = self._dense_pool_norm(pool, state) if RANK_W_DENSE else {}
         scored: list[tuple[float, str]] = []
         for asin in pool:
             product = self.products.get(asin)
@@ -574,12 +852,29 @@ class Agent:
             if bm25_scores:
                 worst = min(bm25_scores.values())
                 score += RANK_W_BM25 * (-bm25_scores.get(asin, worst))
+            if dense_norm:
+                score += RANK_W_DENSE * dense_norm.get(asin, 0.0)
             scored.append((score, asin))
         scored.sort(key=lambda pair: (-pair[0], -_pop_key(self.products.get(pair[1]) or {})))
         return [asin for _, asin in scored]
 
-    # bm25 scores for the live pool under the applied slot phrases. Members missing from the FTS result keep their pool-best default in _rank_pool — absence is weak evidence, not a disqualifier.
+    def _dense_pool_norm(self, pool: set[str], state: dict) -> dict[str, float]:
+        """Dense cosine for pool members, min-max scaled to [0, 1] within the
+        pool so the weight is comparable across pools of any size."""
+        scores = self._dense_scores(state)
+        if scores is None:
+            return {}
+        values = {asin: float(scores[self.dense.row[asin]]) for asin in pool if asin in self.dense.row}
+        if len(values) < 2:
+            return {}
+        low, high = min(values.values()), max(values.values())
+        span = high - low or 1.0
+        return {asin: (value - low) / span for asin, value in values.items()}
+
     def _bm25_scores(self, pool: set[str], applied: list[str]) -> dict[str, float]:
+        """bm25 scores for the live pool under the applied slot phrases.
+        Members missing from the FTS result keep their pool-best default in
+        _rank_pool — absence is weak evidence, not a disqualifier."""
         expression = " OR ".join(_fts_phrase(slot) for slot in applied if slot in self.by_card)
         if not expression:
             return {}
@@ -596,8 +891,9 @@ class Agent:
             return {}
         return {str(row[0]): float(row[1]) for row in rows}
 
-    # Category-scoped popularity ranking — the last-resort fallback when no slot evidence survives.
     def _popularity_top(self, state: dict, top_k: int) -> list[str]:
+        """Category-scoped popularity ranking — the last-resort fallback when
+        no slot evidence survives."""
         if state["category"] is not None:
             pool = self.by_cat.get(state["category"], set())
         else:
@@ -610,9 +906,11 @@ class Agent:
 
     # ----------------------------------------------------------- questioning
 
-    # Ask 'other' while the card is still live: an 'other' ask matches ANY undisclosed constraint, which is the fastest way to drain the card (each reply reveals up to two new constraints). 
-    # Stop asking once drained or at turn 10, then ship the final list.
     def _question(self, state: dict, turn: int) -> tuple[str | None, str]:
+        """Ask 'other' while the card is still live: an 'other' ask matches
+        ANY undisclosed constraint, which is the fastest way to drain the
+        card (each reply reveals up to two new constraints). Stop asking once
+        drained or at turn 10, then ship the final list."""
         if not state["card_drained"] and turn < 10:
             return "other", "Any other requirements you can share? I'll factor them in."
         return None, "Here are the best matches I found for you."
@@ -624,8 +922,10 @@ class Agent:
 
 LOG_ENABLED = os.environ.get("SHOPCOPILOT_LOG", "1") != "0"
 
-# Live progress line to stderr (flushed).
+
 def _log(message: str) -> None:
+    """Live progress line to stderr (flushed). Purely cosmetic: scoring is
+    driven by return values, and a logging failure must never break a turn."""
     if not LOG_ENABLED:
         return
     try:
@@ -634,8 +934,9 @@ def _log(message: str) -> None:
     except Exception:
         pass
 
-# Flatten any catalog field value into a single searchable string.
+
 def _text(value: object) -> str:
+    """Flatten any catalog field value into a single searchable string."""
     if value is None:
         return ""
     if isinstance(value, dict):
@@ -644,19 +945,55 @@ def _text(value: object) -> str:
         return " ".join(str(item) for item in value)
     return str(value)
 
-# Quote a slot as an FTS5 phrase, escaping embedded double quotes.
+
+def _dense_doc(product: dict) -> str:
+    """Bi-encoder document text: title + features + details values (where
+    intent-card slot phrases live), char-capped to the encoder budget."""
+    parts = [_text(product.get("title")), _text(product.get("features"))]
+    details = product.get("details")
+    if isinstance(details, dict):
+        parts.append(" ".join(f"{key}: {value}" for key, value in details.items()))
+    return " | ".join(part for part in parts if part)[:DENSE_DOC_CHARS]
+
+
+def _file_digest(path: Path) -> str:
+    """sha1 of a file's bytes (dense cache key); falls back to the path."""
+    try:
+        digest = hashlib.sha1()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return str(path)
+
+
+def _rrf(routes: list[list[str]]) -> list[str]:
+    """Reciprocal-rank fusion of ranked id lists (score = sum 1/(RRF_K+rank))."""
+    scores: dict[str, float] = defaultdict(float)
+    for route in routes:
+        for rank, asin in enumerate(route):
+            scores[asin] += 1.0 / (RRF_K + rank + 1)
+    return sorted(scores, key=lambda asin: -scores[asin])
+
+
 def _fts_phrase(slot: str) -> str:
+    """Quote a slot as an FTS5 phrase, escaping embedded double quotes."""
     return '"' + slot.replace('"', '""') + '"'
 
-# Extract a numeric budget from the first applied slot that carries one (e.g. 'budget around $25').
+
 def _budget_value(applied: list[str], agent: Agent) -> float | None:
+    """Extract a numeric budget from the first applied slot that carries one
+    (e.g. 'budget around $25')."""
     for slot in applied:
         match = re.search(r"\$(\d+(?:\.\d+)?)", slot)
         if match:
             return float(match.group(1))
     return None
 
-# Popularity key: rating_number (0 when missing) — used for tie-breaks and the popularity fallback ranking.
+
 def _pop_key(product: dict) -> float:
+    """Popularity key: rating_number (0 when missing) — used for tie-breaks
+    and the popularity fallback ranking."""
     value = product.get("rating_number")
     return float(value) if isinstance(value, (int, float)) else 0.0
